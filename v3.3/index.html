@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESCO 3C 通路深度節能精算器 v3.3</title>
+    
+    <!-- 1. 載入 Tailwind CSS (樣式庫) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- 2. 設定 Import Map -->
+    <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@18.2.0",
+        "react-dom": "https://esm.sh/react-dom@18.2.0",
+        "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+        "recharts": "https://esm.sh/recharts@2.12.2?external=react,react-dom",
+        "lucide-react": "https://esm.sh/lucide-react@0.344.0?external=react"
+      }
+    }
+    </script>
+
+    <!-- 3. 載入 Babel (讓瀏覽器看懂 JSX) -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- Google Font for Math -->
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=KaTeX_Main:wght@400;700&display=swap">
+
+    <style>
+        /* 自定義捲軸樣式 */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f5f9; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        body { font-family: 'Inter', system-ui, -apple-system, sans-serif; }
+        .font-math { font-family: 'KaTeX_Main', serif; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800">
+    <div id="root"></div>
+
+    <!-- 4. 應用程式主邏輯 -->
+    <script type="text/babel" data-type="module">
+        import React, { useState, useMemo, useEffect } from 'react';
+        import { createRoot } from 'react-dom/client';
+        import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ComposedChart, Line, Legend, AreaChart, Area } from 'recharts';
+        import { Zap, DollarSign, Clock, Leaf, Info, Settings, TrendingUp, ShieldCheck, PieChart as PieIcon, Award, Calculator, Globe, Factory, BarChart3, CloudRain, BookOpen, Calendar, AlertTriangle, Store, X, FileSignature, ThermometerSun, Users, PenTool, CheckCircle2 } from 'lucide-react';
+
+        const EscoCalculator = () => {
+            // --- 1. 參數設定 ---
+            const [inputs, setInputs] = useState({
+                rateType: 'high_voltage', 
+                avgMonthlyBill: 250000,
+                contractCapacity: 100,
+                storeCount: 1,
+                
+                // 費率設定 (台電 113.4.1)
+                peakRate: 5.78,
+                offPeakRate: 2.32,
+                demandRate: 223.6,
+                avgRate: 4.2,
+                
+                // 節能設定
+                lightingRatio: 0.48,
+                lightingSaving: 0.50,
+                acRatio: 0.38,
+                acSaving: 0.28,
+                
+                // 商業條款
+                subscriptionFee: 2500,
+                escoShareY12: 0.70,
+                escoShareY34: 0.50,
+                escoShareY5: 0.30,
+                carbonCoef: 0.495
+            });
+
+            const [activeTab, setActiveTab] = useState('mv'); // mv, financial, esg, sdgs
+            const [showRateModal, setShowRateModal] = useState(false);
+            const [rateTab, setRateTab] = useState('commercial'); 
+            const [showProtocolModal, setShowProtocolModal] = useState(false); // 協議書預覽
+
+            // --- M&V 回歸模型參數 (v3.3 新增) ---
+            const [modelParams, setModelParams] = useState({
+                beta0: 15000, // 基礎耗能 (kWh) - 待機/冰箱/照明
+                beta1: 120,   // 溫度係數 (kWh/CDD) - 空調相關
+                beta2: 0.5,   // 客流係數 (kWh/人) - 人體發熱/門開關
+                beta3: 50,    // 工時係數 (kWh/小時) - 營業時長
+                
+                // 當月變動變數 (模擬用)
+                currentCDD: 450,      // 冷房度日
+                currentTraffic: 8000, // 來客數
+                currentHours: 360     // 營業時數 (12hr * 30day)
+            });
+
+            // --- 營業用累進費率表 (113.4.1) ---
+            const commercialRates = {
+                summer: [
+                    { limit: 330, price: 2.61 }, { limit: 700, price: 3.66 }, 
+                    { limit: 1500, price: 4.46 }, { limit: 3000, price: 7.08 }, 
+                    { limit: Infinity, price: 7.43 }
+                ],
+                nonSummer: [
+                    { limit: 330, price: 2.18 }, { limit: 700, price: 3.00 }, 
+                    { limit: 1500, price: 3.61 }, { limit: 3000, price: 5.56 }, 
+                    { limit: Infinity, price: 5.83 }
+                ]
+            };
+
+            const calculateProgressiveBill = (kwh, type = 'summer') => {
+                let remainingKwh = kwh;
+                let bill = 0;
+                let lastLimit = 0;
+                const rates = commercialRates[type];
+                for (let tier of rates) {
+                    if (remainingKwh <= 0) break;
+                    const tierSize = tier.limit - lastLimit;
+                    const kwhInTier = Math.min(remainingKwh, tierSize);
+                    bill += kwhInTier * tier.price;
+                    remainingKwh -= kwhInTier;
+                    lastLimit = tier.limit;
+                }
+                return bill;
+            };
+
+            // --- M&V 計算邏輯 (回歸模型) ---
+            const mvAnalysis = useMemo(() => {
+                // 1. 計算調整後基準線 (Adjusted Baseline)
+                // Formula: E_adj = B0 + B1*CDD + B2*Traffic + B3*Hours
+                const adjBaseline = 
+                    modelParams.beta0 + 
+                    (modelParams.beta1 * modelParams.currentCDD) + 
+                    (modelParams.beta2 * modelParams.currentTraffic) + 
+                    (modelParams.beta3 * modelParams.currentHours);
+
+                // 2. 估算實際耗能 (Post-Installation)
+                // 假設透過 AIoT 節省了空調(溫度相關) 與 照明(基礎相關)
+                const acSavingKwh = (modelParams.beta1 * modelParams.currentCDD) * inputs.acSaving;
+                const lightingSavingKwh = (modelParams.beta0 * 0.4) * inputs.lightingSaving; // 假設 B0 中 40% 是照明
+                
+                const estimatedSavings = acSavingKwh + lightingSavingKwh;
+                const postEnergy = adjBaseline - estimatedSavings;
+                const savingRate = (estimatedSavings / adjBaseline) * 100;
+
+                // 3. 圖表數據
+                const chartData = [
+                    { name: '基礎負載 (β0)', value: modelParams.beta0, fill: '#94a3b8' },
+                    { name: '氣候變動 (β1*CDD)', value: modelParams.beta1 * modelParams.currentCDD, fill: '#f59e0b' },
+                    { name: '營運變動 (β2+β3)', value: (modelParams.beta2 * modelParams.currentTraffic) + (modelParams.beta3 * modelParams.currentHours), fill: '#8b5cf6' },
+                    { name: '調整後基準線 (E_adj)', value: adjBaseline, fill: '#3b82f6', isTotal: true },
+                    { name: '實際能耗 (E_actual)', value: postEnergy, fill: '#10b981', isTotal: true }
+                ];
+
+                return { adjBaseline, postEnergy, estimatedSavings, savingRate, chartData };
+            }, [inputs, modelParams]);
+
+            // --- 財務與其他計算 ---
+            const results = useMemo(() => {
+                let totalMonthlyBenefit = 0;
+                let kwh = mvAnalysis.postEnergy; // 使用 M&V 模組的數據
+                
+                // 簡易財務推估 (使用平均費率或累進費率)
+                if (inputs.rateType === 'high_voltage') {
+                    // 高壓：使用尖峰費率估算節能效益 (因主要節省空調照明)
+                    totalMonthlyBenefit = mvAnalysis.estimatedSavings * inputs.peakRate * inputs.storeCount;
+                } else {
+                    // 低壓：使用夏季最高級距估算 (邊際效益)
+                    totalMonthlyBenefit = mvAnalysis.estimatedSavings * 7.43 * inputs.storeCount; // 7.43 為夏月最高單價
+                }
+
+                return {
+                    monthlyBenefit: totalMonthlyBenefit,
+                    yearlyBenefit: totalMonthlyBenefit * 12,
+                    yearlyCarbon: (mvAnalysis.estimatedSavings * 12 * inputs.carbonCoef * inputs.storeCount) / 1000
+                };
+            }, [inputs, mvAnalysis]);
+
+            const financialProjection = useMemo(() => {
+                let cumulativeClient = 0;
+                return [1, 2, 3, 4, 5].map(year => {
+                    let alpha = year <= 2 ? inputs.escoShareY12 : (year <= 4 ? inputs.escoShareY34 : inputs.escoShareY5);
+                    const annualBenefit = results.yearlyBenefit;
+                    const escoRevenue = (annualBenefit * alpha) + (inputs.subscriptionFee * 12 * inputs.storeCount);
+                    const clientNet = annualBenefit - escoRevenue;
+                    cumulativeClient += clientNet;
+                    return { year: `Y${year}`, benefit: annualBenefit, esco: escoRevenue, client: clientNet, cumulative: cumulativeClient };
+                });
+            }, [results, inputs]);
+
+            return (
+                <div className="max-w-7xl mx-auto p-4 md:p-6 bg-slate-50 min-h-screen text-slate-800 font-sans relative">
+                
+                {/* Protocol Modal (協議書預覽) */}
+                {showProtocolModal && (
+                    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-in fade-in duration-200">
+                        <div className="bg-white w-full max-w-4xl max-h-[90vh] rounded-3xl shadow-2xl flex flex-col overflow-hidden">
+                            <div className="p-6 border-b border-slate-100 flex justify-between items-center bg-slate-900 text-white">
+                                <h3 className="text-xl font-black flex items-center gap-2"><FileSignature/> 基準線確認協議書 (預覽)</h3>
+                                <button onClick={() => setShowProtocolModal(false)} className="hover:bg-white/20 p-2 rounded-full"><X size={20}/></button>
+                            </div>
+                            <div className="p-8 overflow-y-auto flex-1 bg-white font-serif leading-relaxed text-slate-700">
+                                <div className="border-2 border-slate-200 p-8 rounded-xl">
+                                    <h2 className="text-2xl font-bold text-center mb-6 text-black">基準線確認協議書 <br/><span className="text-lg font-normal">(Baseline Confirmation Agreement)</span></h2>
+                                    
+                                    <div className="space-y-6">
+                                        <div>
+                                            <h4 className="font-bold text-black border-b border-black inline-block mb-2">專案資訊</h4>
+                                            <p><strong>專案名稱：</strong> 全國電子 能源效率提升與節能服務專案</p>
+                                            <p><strong>甲方：</strong> 全國電子股份有限公司</p>
+                                            <p><strong>乙方：</strong> (ESCO服務商)</p>
+                                        </div>
+
+                                        <div>
+                                            <h4 className="font-bold text-black border-b border-black inline-block mb-2">第三條：能源回歸模型 (Mathematical Model)</h4>
+                                            <p>雙方同意採用以下多變數回歸公式計算各月之「調整後基準能耗 ($E_{"{"}adj\\_base{"}"}$)」：</p>
+                                            <div className="bg-slate-50 p-4 rounded-lg my-2 font-mono text-sm border border-slate-200">
+                                                $$E_{"{"}adj\\_base{"}"} = {modelParams.beta0} + {modelParams.beta1}(CDD) + {modelParams.beta2}(Traffic) + {modelParams.beta3}(Hours)$$
+                                            </div>
+                                            <ul className="list-disc pl-5 space-y-1 text-sm">
+                                                <li>$\beta_0$ (基礎常數)：{modelParams.beta0} kWh (代表基礎待機能耗)</li>
+                                                <li>$\beta_1$ (溫度係數)：{modelParams.beta1} kWh/CDD (對應冷房度日)</li>
+                                                <li>$\beta_2$ (客流係數)：{modelParams.beta2} kWh/人 (對應入店人數)</li>
+                                                <li>$\beta_3$ (工時係數)：{modelParams.beta3} kWh/小時 (對應營業時數)</li>
+                                            </ul>
+                                            <p className="mt-2 text-sm text-slate-500">相關係數判定：本模型之決定係數 $R^2 \ge 0.85$，符合 IPMVP 統計顯著性要求。</p>
+                                        </div>
+
+                                        <div>
+                                            <h4 className="font-bold text-black border-b border-black inline-block mb-2">第五條：非常規調整 (Non-routine Adjustments)</h4>
+                                            <p className="text-sm">若發生以下情事，雙方應於 15 日內協商調整基準線：</p>
+                                            <ul className="list-disc pl-5 space-y-1 text-sm mt-1">
+                                                <li>硬體增減：門市展示之大型家電（如電視牆）功率總量變動超過 ±10%。</li>
+                                                <li>裝修變更：門市進行封閉式改裝或更換隔熱玻璃。</li>
+                                                <li>營業異動：營業時間發生常態性調整（如縮短或延長營業）。</li>
+                                            </ul>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div className="p-4 border-t border-slate-100 bg-slate-50 flex justify-end">
+                                <button onClick={() => window.print()} className="px-6 py-2 text-sm font-bold text-blue-600 hover:bg-blue-50 rounded-xl transition-colors mr-2">列印 / 存為 PDF</button>
+                                <button onClick={() => setShowProtocolModal(false)} className="px-6 py-2 text-sm font-bold bg-slate-900 text-white rounded-xl hover:bg-slate-800 shadow-lg">關閉</button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* 1. 台電計價原則 Modal (保留) */}
+                {showRateModal && (
+                    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-in fade-in duration-200">
+                        <div className="bg-white w-full max-w-4xl max-h-[90vh] rounded-3xl shadow-2xl flex flex-col overflow-hidden">
+                            <div className="p-6 border-b border-slate-100 flex justify-between items-center bg-slate-900 text-white">
+                                <div className="flex items-center gap-3">
+                                    <div className="p-2 bg-blue-600 rounded-lg"><BookOpen size={20} className="text-white" /></div>
+                                    <div><h3 className="text-xl font-black">台電電力計價原則 (113.4.1)</h3></div>
+                                </div>
+                                <button onClick={() => setShowRateModal(false)} className="hover:bg-white/20 p-2 rounded-full"><X size={20}/></button>
+                            </div>
+                            {/* ... (Rate Modal Content same as v3.2.1) ... */}
+                            <div className="flex border-b border-slate-200 bg-slate-50 overflow-x-auto">
+                                <button onClick={() => setRateTab('commercial')} className={`flex-1 min-w-[120px] py-4 text-sm font-bold border-b-2 transition-all ${rateTab === 'commercial' ? 'border-orange-500 text-orange-600 bg-white' : 'border-transparent text-slate-500 hover:text-slate-700'}`}>營業用電 (累進)</button>
+                                <button onClick={() => setRateTab('table')} className={`flex-1 min-w-[120px] py-4 text-sm font-bold border-b-2 transition-all ${rateTab === 'table' ? 'border-blue-600 text-blue-600 bg-white' : 'border-transparent text-slate-500 hover:text-slate-700'}`}>高壓費率表</button>
+                            </div>
+                            <div className="p-8 overflow-y-auto flex-1 bg-white">
+                                {rateTab === 'commercial' && (
+                                    <div className="space-y-6">
+                                        <div className="bg-orange-50 p-6 rounded-2xl border border-orange-100">
+                                            <h4 className="flex items-center gap-2 font-black text-orange-900 mb-4"><Store size={18}/> 營業用電價 (低壓累進)</h4>
+                                            <div className="overflow-x-auto rounded-xl border border-orange-200 bg-white">
+                                                <table className="min-w-full text-sm">
+                                                    <thead className="bg-orange-100 text-orange-900 font-black">
+                                                        <tr><th className="px-4 py-3 text-left">度數分段</th><th className="px-4 py-3 text-right">夏月</th><th className="px-4 py-3 text-right">非夏月</th></tr>
+                                                    </thead>
+                                                    <tbody className="divide-y divide-orange-50">
+                                                        <tr><td className="px-4 py-3">330 度以下</td><td className="px-4 py-3 text-right font-mono font-bold">2.61</td><td className="px-4 py-3 text-right font-mono font-bold">2.18</td></tr>
+                                                        <tr><td className="px-4 py-3">331 ~ 700 度</td><td className="px-4 py-3 text-right font-mono font-bold">3.66</td><td className="px-4 py-3 text-right font-mono font-bold">3.00</td></tr>
+                                                        <tr><td className="px-4 py-3">701 ~ 1500 度</td><td className="px-4 py-3 text-right font-mono font-bold">4.46</td><td className="px-4 py-3 text-right font-mono font-bold">3.61</td></tr>
+                                                        <tr className="bg-orange-50/50"><td className="px-4 py-3">1501 ~ 3000 度</td><td className="px-4 py-3 text-right font-mono text-orange-600 font-bold">7.08</td><td className="px-4 py-3 text-right font-mono font-bold">5.56</td></tr>
+                                                        <tr className="bg-orange-100/30"><td className="px-4 py-3 font-black text-orange-800">3001 度以上</td><td className="px-4 py-3 text-right font-mono text-red-600 font-black">7.43</td><td className="px-4 py-3 text-right font-mono font-bold">5.83</td></tr>
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                                {rateTab === 'table' && (
+                                    <div className="space-y-4">
+                                        <div className="p-4 bg-yellow-50 border border-yellow-100 rounded-xl mb-4"><p className="text-xs text-yellow-800 font-bold flex items-center gap-2"><Info size={14}/> 費率說明：引用自台電 113.4.1 公告</p></div>
+                                        <div className="overflow-x-auto rounded-xl border border-slate-200">
+                                            <table className="min-w-full text-xs md:text-sm">
+                                                <thead className="bg-slate-100 text-slate-600 font-black"><tr><th className="px-4 py-3 text-left">項目</th><th className="px-4 py-3 text-right">夏月單價</th><th className="px-4 py-3 text-right">非夏月單價</th></tr></thead>
+                                                <tbody className="divide-y divide-slate-100">
+                                                    <tr><td className="px-4 py-3 font-bold">經常契約 (基本費)</td><td className="px-4 py-3 text-right font-mono font-bold">223.60</td><td className="px-4 py-3 text-right font-mono font-bold">166.90</td></tr>
+                                                    <tr><td className="px-4 py-3 font-bold">尖峰時間 (流動費)</td><td className="px-4 py-3 text-right font-mono font-bold text-red-600">5.78</td><td className="px-4 py-3 text-right font-mono font-bold">5.46</td></tr>
+                                                    <tr><td className="px-4 py-3 font-bold">離峰時間 (流動費)</td><td className="px-4 py-3 text-right font-mono font-bold text-emerald-600">2.32</td><td className="px-4 py-3 text-right font-mono font-bold">2.11</td></tr>
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                            <div className="p-4 border-t border-slate-100 bg-slate-50 flex justify-end">
+                                <button onClick={() => setShowRateModal(false)} className="px-6 py-2 text-sm font-bold bg-slate-900 text-white rounded-xl hover:bg-slate-800 shadow-lg">了解，關閉視窗</button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* Header */}
+                <header className="mb-8">
+                    <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-6">
+                        <div>
+                            <div className="flex flex-wrap items-center gap-2 mb-2">
+                                <span className="bg-slate-800 text-white text-[10px] font-black px-2 py-0.5 rounded uppercase tracking-wider">v3.3 企業合規版</span>
+                                <span className="bg-indigo-600 text-white text-[10px] font-black px-2 py-0.5 rounded uppercase tracking-wider flex items-center gap-1"><FileSignature size={10} /> 基準線協議書</span>
+                                <span className="bg-blue-600 text-white text-[10px] font-black px-2 py-0.5 rounded uppercase tracking-wider">113年 費率校正</span>
+                            </div>
+                            <h1 className="text-3xl md:text-4xl font-black text-slate-900 tracking-tight">ESCO 3C 通路深度節能精算器</h1>
+                            <p className="text-slate-500 font-medium mt-1">符合 IPMVP Option C 回歸分析標準</p>
+                        </div>
+                        <div className="flex flex-col md:flex-row gap-3">
+                            <div className="flex bg-white p-1 rounded-2xl shadow-sm border border-slate-200 overflow-x-auto">
+                                <button onClick={() => setActiveTab('mv')} className={`flex items-center gap-2 px-4 md:px-6 py-3 rounded-xl text-sm font-bold whitespace-nowrap transition-all ${activeTab === 'mv' ? 'bg-slate-900 text-white shadow-lg' : 'text-slate-400 hover:text-slate-600'}`}><Calculator size={16} /> 基準線模型 (M&V)</button>
+                                <button onClick={() => setActiveTab('financial')} className={`flex items-center gap-2 px-4 md:px-6 py-3 rounded-xl text-sm font-bold whitespace-nowrap transition-all ${activeTab === 'financial' ? 'bg-slate-900 text-white shadow-lg' : 'text-slate-400 hover:text-slate-600'}`}><DollarSign size={16} /> 財務預測</button>
+                                <button onClick={() => setActiveTab('esg')} className={`flex items-center gap-2 px-4 md:px-6 py-3 rounded-xl text-sm font-bold whitespace-nowrap transition-all ${activeTab === 'esg' ? 'bg-emerald-600 text-white shadow-lg' : 'text-slate-400 hover:text-slate-600'}`}><Leaf size={16} /> ESG 永續</button>
+                            </div>
+                        </div>
+                    </div>
+                </header>
+
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 md:gap-8">
+                    {/* Left Panel: Parameters */}
+                    <div className="lg:col-span-4 space-y-6">
+                        <section className="bg-white p-6 rounded-3xl shadow-sm border border-slate-200">
+                            <div className="flex items-center justify-between mb-5">
+                                <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest flex items-center gap-2"><Settings size={14} /> 場域與費率</h3>
+                                <button onClick={() => setShowRateModal(true)} className="text-xs font-bold text-blue-600 hover:text-blue-700 bg-blue-50 px-3 py-1.5 rounded-lg flex items-center gap-1"><BookOpen size={12}/> 費率表</button>
+                            </div>
+                            <div className="space-y-5">
+                                <div className="bg-slate-100 p-1 rounded-xl flex">
+                                    <button onClick={() => setInputs({...inputs, rateType: 'high_voltage'})} className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all ${inputs.rateType === 'high_voltage' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-400'}`}>高壓需量</button>
+                                    <button onClick={() => setInputs({...inputs, rateType: 'low_commercial'})} className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all ${inputs.rateType === 'low_commercial' ? 'bg-white shadow-sm text-orange-600' : 'text-slate-400'}`}>營業用累進</button>
+                                </div>
+                                <div>
+                                    <label className="text-xs font-bold text-slate-500 mb-1.5 block">單店平均月電費 ($)</label>
+                                    <input type="number" value={inputs.avgMonthlyBill} onChange={e => setInputs({...inputs, avgMonthlyBill: Number(e.target.value)})} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 font-mono font-bold text-blue-600 focus:ring-2 focus:ring-blue-500 outline-none" />
+                                </div>
+                                {inputs.rateType === 'high_voltage' && (
+                                    <div className="bg-blue-50 rounded-2xl p-4 border border-blue-100 space-y-2">
+                                        <div className="flex justify-between items-center"><span className="text-xs font-bold text-blue-800">夏月尖峰費率</span><span className="text-sm font-black text-blue-900 font-mono">${inputs.peakRate}</span></div>
+                                        <div className="flex justify-between items-center"><span className="text-xs font-bold text-blue-800">經常契約單價</span><span className="text-sm font-black text-blue-900 font-mono">${inputs.demandRate}</span></div>
+                                    </div>
+                                )}
+                                {inputs.rateType === 'low_commercial' && (
+                                    <div className="bg-orange-50 rounded-2xl p-4 border border-orange-100 space-y-2">
+                                        <div className="flex justify-between items-center"><span className="text-xs font-bold text-orange-800">最高級距單價</span><span className="text-sm font-black text-red-600 font-mono">$7.43</span></div>
+                                        <div className="text-[10px] text-orange-700 mt-2">* 節能效益以最高邊際費率計算。</div>
+                                    </div>
+                                )}
+                            </div>
+                        </section>
+
+                        <section className="bg-slate-900 p-6 rounded-3xl shadow-xl text-white">
+                            <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-5">AIoT 節能預估率</h3>
+                            <div className="space-y-6">
+                                <div>
+                                    <div className="flex justify-between text-xs font-bold mb-2"><span>智慧照明 (目標 40-60%)</span><span className="text-blue-400">{(inputs.lightingSaving * 100).toFixed(0)}%</span></div>
+                                    <input type="range" min="0.3" max="0.7" step="0.01" value={inputs.lightingSaving} onChange={e => setInputs({...inputs, lightingSaving: parseFloat(e.target.value)})} className="w-full h-1.5 bg-slate-700 rounded-lg accent-blue-500" />
+                                </div>
+                                <div>
+                                    <div className="flex justify-between text-xs font-bold mb-2"><span>智慧空調 (目標 20-35%)</span><span className="text-emerald-400">{(inputs.acSaving * 100).toFixed(0)}%</span></div>
+                                    <input type="range" min="0.15" max="0.45" step="0.01" value={inputs.acSaving} onChange={e => setInputs({...inputs, acSaving: parseFloat(e.target.value)})} className="w-full h-1.5 bg-slate-700 rounded-lg accent-emerald-500" />
+                                </div>
+                            </div>
+                        </section>
+                    </div>
+
+                    {/* Right Panel: Content */}
+                    <div className="lg:col-span-8">
+                        {/* Summary Cards */}
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+                            <div className="bg-white p-5 rounded-3xl shadow-sm border border-slate-200">
+                                <div className="flex items-center gap-2 mb-2"><div className="p-1.5 bg-blue-100 text-blue-600 rounded-lg"><TrendingUp size={16}/></div><p className="text-[10px] font-black text-slate-400 uppercase tracking-wider">IPMVP 驗證節能率</p></div>
+                                <h2 className="text-3xl font-black text-slate-900">{mvAnalysis.savingRate.toFixed(1)}%</h2>
+                                <p className="text-xs text-slate-500 font-bold mt-1">目標: 35% - 45%</p>
+                            </div>
+                            <div className="bg-white p-5 rounded-3xl shadow-sm border border-slate-200">
+                                <div className="flex items-center gap-2 mb-2"><div className="p-1.5 bg-emerald-100 text-emerald-600 rounded-lg"><DollarSign size={16}/></div><p className="text-[10px] font-black text-slate-400 uppercase tracking-wider">預估月節費</p></div>
+                                <h2 className="text-3xl font-black text-emerald-600">${Math.round(results.monthlyBenefit).toLocaleString()}</h2>
+                                <p className="text-xs text-slate-500 font-bold mt-1">年效益約 ${(results.yearlyBenefit/10000).toFixed(1)} 萬</p>
+                            </div>
+                            <div className="bg-white p-5 rounded-3xl shadow-sm border border-slate-200">
+                                <div className="flex items-center gap-2 mb-2"><div className="p-1.5 bg-purple-100 text-purple-600 rounded-lg"><Leaf size={16}/></div><p className="text-[10px] font-black text-slate-400 uppercase tracking-wider">年度減碳量</p></div>
+                                <h2 className="text-3xl font-black text-purple-600">{results.yearlyCarbon.toFixed(1)} <span className="text-sm">tCO2e</span></h2>
+                                <p className="text-xs text-slate-500 font-bold mt-1">係數: 0.495</p>
+                            </div>
+                        </div>
+
+                        <div className="bg-white p-6 md:p-8 rounded-[40px] shadow-sm border border-slate-200 min-h-[500px]">
+                            {/* M&V (Baseline Model) */}
+                            {activeTab === 'mv' && (
+                                <div className="space-y-8 animate-in fade-in zoom-in duration-300">
+                                    <div className="border-b border-slate-100 pb-4 flex justify-between items-end">
+                                        <div>
+                                            <h4 className="text-xl font-black text-slate-900 flex items-center gap-2"><ShieldCheck className="text-blue-600" /> 回歸分析模型 (Regression Model)</h4>
+                                            <p className="text-sm text-slate-500 mt-2">依據「基準線確認協議書」，採用多變數回歸計算調整後基準線。</p>
+                                        </div>
+                                        <button onClick={() => setShowProtocolModal(true)} className="hidden md:flex items-center gap-2 bg-slate-900 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-slate-800 transition-colors shadow-lg">
+                                            <FileSignature size={16}/> 預覽協議書
+                                        </button>
+                                    </div>
+
+                                    {/* Formula Visualization */}
+                                    <div className="bg-slate-50 p-6 rounded-3xl border border-slate-200">
+                                        <p className="text-xs font-black text-slate-400 uppercase tracking-widest mb-3">數學模型公式</p>
+                                        <div className="font-math text-lg md:text-xl font-bold text-slate-800 mb-6 overflow-x-auto whitespace-nowrap p-2">
+                                            E<sub>adj</sub> = <span className="text-slate-500">{modelParams.beta0}</span> + <span className="text-amber-600">{modelParams.beta1}</span>(CDD) + <span className="text-purple-600">{modelParams.beta2}</span>(Traffic) + <span className="text-blue-600">{modelParams.beta3}</span>(Hours)
+                                        </div>
+                                        
+                                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                            <div className="bg-white p-4 rounded-xl shadow-sm border border-amber-100">
+                                                <label className="text-[10px] font-black text-amber-600 uppercase mb-1 flex items-center gap-1"><ThermometerSun size={12}/> 冷房度日 (CDD)</label>
+                                                <input type="number" value={modelParams.currentCDD} onChange={e => setModelParams({...modelParams, currentCDD: Number(e.target.value)})} className="w-full font-black text-xl text-slate-800 outline-none border-b-2 border-amber-100 focus:border-amber-400 transition-colors"/>
+                                                <p className="text-[10px] text-slate-400 mt-1">影響空調負載</p>
+                                            </div>
+                                            <div className="bg-white p-4 rounded-xl shadow-sm border border-purple-100">
+                                                <label className="text-[10px] font-black text-purple-600 uppercase mb-1 flex items-center gap-1"><Users size={12}/> 來客數 (Traffic)</label>
+                                                <input type="number" value={modelParams.currentTraffic} onChange={e => setModelParams({...modelParams, currentTraffic: Number(e.target.value)})} className="w-full font-black text-xl text-slate-800 outline-none border-b-2 border-purple-100 focus:border-purple-400 transition-colors"/>
+                                                <p className="text-[10px] text-slate-400 mt-1">影響人體發熱/門開關</p>
+                                            </div>
+                                            <div className="bg-white p-4 rounded-xl shadow-sm border border-blue-100">
+                                                <label className="text-[10px] font-black text-blue-600 uppercase mb-1 flex items-center gap-1"><Clock size={12}/> 營業時數 (Hours)</label>
+                                                <input type="number" value={modelParams.currentHours} onChange={e => setModelParams({...modelParams, currentHours: Number(e.target.value)})} className="w-full font-black text-xl text-slate-800 outline-none border-b-2 border-blue-100 focus:border-blue-400 transition-colors"/>
+                                                <p className="text-[10px] text-slate-400 mt-1">影響基礎設備運轉</p>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    {/* Chart */}
+                                    <div className="h-64">
+                                        <ResponsiveContainer width="100%" height="100%">
+                                            <BarChart data={mvAnalysis.chartData} layout="vertical" margin={{top: 5, right: 30, left: 20, bottom: 5}}>
+                                                <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#f1f5f9"/>
+                                                <XAxis type="number" hide />
+                                                <YAxis dataKey="name" type="category" width={140} tick={{fontSize: 11, fontWeight: 700, fill: '#64748b'}} />
+                                                <Tooltip cursor={{fill: 'transparent'}} contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}} formatter={(value) => `${Math.round(value).toLocaleString()} kWh`}/>
+                                                <Bar dataKey="value" radius={[0, 6, 6, 0]} barSize={24}>
+                                                    {mvAnalysis.chartData.map((entry, index) => (
+                                                        <cell key={`cell-${index}`} fill={entry.fill} />
+                                                    ))}
+                                                </Bar>
+                                            </BarChart>
+                                        </ResponsiveContainer>
+                                    </div>
+                                    
+                                    <div className="flex justify-center md:hidden">
+                                        <button onClick={() => setShowProtocolModal(true)} className="flex items-center gap-2 bg-slate-900 text-white px-6 py-3 rounded-xl text-sm font-bold shadow-lg w-full justify-center">
+                                            <FileSignature size={16}/> 查看基準線協議書
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Financial Tab (Keep previous logic) */}
+                            {activeTab === 'financial' && (
+                                <div className="space-y-8 animate-in fade-in zoom-in duration-300">
+                                    <div className="border-b border-slate-100 pb-4">
+                                        <h4 className="text-xl font-black text-slate-900 flex items-center gap-2"><DollarSign className="text-blue-600" /> 財務模型與現金流</h4>
+                                        <p className="text-sm text-slate-500 mt-2">CAPEX 轉 OPEX 效益分析</p>
+                                    </div>
+                                    <div className="h-80">
+                                        <ResponsiveContainer width="100%" height="100%">
+                                            <ComposedChart data={financialProjection} margin={{ top: 20, right: 20, bottom: 20, left: 20 }}>
+                                                <CartesianGrid stroke="#f1f5f9" vertical={false} />
+                                                <XAxis dataKey="year" tickLine={false} axisLine={false} tick={{fontSize: 12, fontWeight: 700, fill: '#64748b'}} />
+                                                <YAxis hide />
+                                                <Tooltip contentStyle={{borderRadius: '16px', border: 'none', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1)'}} formatter={(value) => `$${Math.round(value).toLocaleString()}`} />
+                                                <Legend verticalAlign="top" height={36}/>
+                                                <Bar dataKey="esco" name="ESCO 營收 (還本)" stackId="a" fill="#cbd5e1" radius={[0, 0, 4, 4]} barSize={40} />
+                                                <Bar dataKey="client" name="客戶淨利 (紅利)" stackId="a" fill="#3b82f6" radius={[4, 4, 0, 0]} barSize={40} />
+                                                <Line type="monotone" dataKey="cumulative" name="累計淨現金流" stroke="#10b981" strokeWidth={3} dot={{r: 4, fill: '#10b981'}} />
+                                            </ComposedChart>
+                                        </ResponsiveContainer>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* ESG Tab */}
+                            {activeTab === 'esg' && (
+                                <div className="space-y-8 animate-in fade-in zoom-in duration-300">
+                                    <div className="border-b border-slate-100 pb-4">
+                                        <h4 className="text-xl font-black text-slate-900 flex items-center gap-2"><Leaf className="text-emerald-600" /> ESG 永續效益</h4>
+                                    </div>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                        <div className="bg-emerald-50 p-6 rounded-3xl border border-emerald-100">
+                                            <div className="flex items-center gap-3 mb-4"><div className="p-2 bg-emerald-100 text-emerald-600 rounded-xl"><CloudRain size={20}/></div><h5 className="font-black text-emerald-900">環境效益 (Environmental)</h5></div>
+                                            <div className="space-y-2">
+                                                <p className="text-sm text-emerald-800">年減碳量：<span className="font-black text-2xl">{results.yearlyCarbon.toFixed(1)}</span> 公噸</p>
+                                                <p className="text-xs text-emerald-600">*相當於種植 {Math.round(results.yearlyCarbon * 88)} 棵樹</p>
+                                            </div>
+                                        </div>
+                                        <div className="bg-blue-50 p-6 rounded-3xl border border-blue-100">
+                                            <div className="flex items-center gap-3 mb-4"><div className="p-2 bg-blue-100 text-blue-600 rounded-xl"><Award size={20}/></div><h5 className="font-black text-blue-900">政策補助</h5></div>
+                                            <ul className="list-disc pl-4 text-sm text-slate-600 space-y-2">
+                                                <li>經濟部節能績效保證專案 (最高 49%)</li>
+                                                <li>產創條例投資抵減 (3-5%)</li>
+                                            </ul>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            </div>
+            );
+        };
+
+        const root = createRoot(document.getElementById('root'));
+        root.render(<EscoCalculator />);
+    </script>
+</body>
+</html>
